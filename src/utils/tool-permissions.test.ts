@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, afterEach } from 'vitest';
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { existsSync, writeFileSync, mkdirSync, rmSync } from 'fs';
 import { loadApprovedTools, saveApprovedTools } from './tool-permissions.js';
 

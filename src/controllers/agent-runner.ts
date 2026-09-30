@@ -1,14 +1,33 @@
 import { Agent } from '../agent/agent.js';
 import type { InMemoryChatHistory } from '../utils/in-memory-chat-history.js';
+import { defaultQueue } from '../utils/message-queue.js';
 import type {
   AgentConfig,
   AgentEvent,
   ApprovalDecision,
   DoneEvent,
 } from '../agent/index.js';
-import type { DisplayEvent } from '../agent/types.js';
-import type { HistoryItem, HistoryItemStatus, WorkingState } from '../types.js';
+import type { Question, UserAnswers } from '../tools/ask-user-question/types.js';
+import type { PermissionDecision } from '../permissions/types.js';
+
+/** A pending approval request surfaced to the CLI overlay. */
+export interface PendingApproval {
+  tool: string;
+  args: Record<string, unknown>;
+  /** For bash: the command being approved (shown instead of args.path). */
+  command?: string;
+  /** The engine's decision (reason, classification, etc.). */
+  decision?: PermissionDecision;
+}
+import type { DisplayEvent, StreamMode } from '../agent/types.js';
 import { loadApprovedTools } from '../utils/tool-permissions.js';
+import type { HistoryItem, HistoryItemStatus, WorkingState } from '../types.js';
+
+export interface TurnStats {
+  turnStartMs: number;
+  streamedChars: number;
+  streamMode: StreamMode;
+}
 
 type ChangeListener = () => void;
 
@@ -20,12 +39,17 @@ export class AgentRunnerController {
   private historyValue: HistoryItem[] = [];
   private workingStateValue: WorkingState = { status: 'idle' };
   private errorValue: string | null = null;
-  private pendingApprovalValue: { tool: string; args: Record<string, unknown> } | null = null;
-  private readonly agentConfig: AgentConfig;
+  private pendingApprovalValue: PendingApproval | null = null;
+  private pendingQuestionValue: { questions: Question[] } | null = null;
+  private turnStartMsValue: number | null = null;
+  private streamedCharsValue = 0;
+  private streamModeValue: StreamMode | null = null;
+  private agentConfig: AgentConfig;
   private readonly inMemoryChatHistory: InMemoryChatHistory;
   private readonly onChange?: ChangeListener;
   private abortController: AbortController | null = null;
   private approvalResolve: ((decision: ApprovalDecision) => void) | null = null;
+  private questionResolve: ((answers: UserAnswers) => void) | null = null;
   private sessionApprovedTools = new Set<string>(loadApprovedTools());
 
   constructor(
@@ -50,8 +74,21 @@ export class AgentRunnerController {
     return this.errorValue;
   }
 
-  get pendingApproval(): { tool: string; args: Record<string, unknown> } | null {
+  get pendingApproval(): PendingApproval | null {
     return this.pendingApprovalValue;
+  }
+
+  get pendingQuestion(): { questions: Question[] } | null {
+    return this.pendingQuestionValue;
+  }
+
+  get turnStats(): TurnStats | null {
+    if (this.turnStartMsValue === null) return null;
+    return {
+      turnStartMs: this.turnStartMsValue,
+      streamedChars: this.streamedCharsValue,
+      streamMode: this.streamModeValue ?? 'requesting',
+    };
   }
 
   get isProcessing(): boolean {
@@ -63,6 +100,17 @@ export class AgentRunnerController {
   setError(error: string | null) {
     this.errorValue = error;
     this.emitChange();
+  }
+
+  get currentConfig(): Readonly<AgentConfig> {
+    return this.agentConfig;
+  }
+
+  updateAgentConfig(config: Partial<Pick<AgentConfig, 'model' | 'modelProvider' | 'maxIterations'>>) {
+    this.agentConfig = {
+      ...this.agentConfig,
+      ...config,
+    };
   }
 
   respondToApproval(decision: ApprovalDecision) {
@@ -78,6 +126,17 @@ export class AgentRunnerController {
     this.emitChange();
   }
 
+  respondToQuestion(answers: UserAnswers) {
+    if (!this.questionResolve) {
+      return;
+    }
+    this.questionResolve(answers);
+    this.questionResolve = null;
+    this.pendingQuestionValue = null;
+    this.workingStateValue = { status: 'thinking' };
+    this.emitChange();
+  }
+
   cancelExecution() {
     if (this.abortController) {
       this.abortController.abort();
@@ -88,14 +147,26 @@ export class AgentRunnerController {
       this.approvalResolve = null;
       this.pendingApprovalValue = null;
     }
+    if (this.questionResolve) {
+      this.questionResolve({ answers: [], declined: true });
+      this.questionResolve = null;
+      this.pendingQuestionValue = null;
+    }
     this.markLastProcessing('interrupted');
     this.workingStateValue = { status: 'idle' };
+    this.resetTurnStats();
     this.emitChange();
   }
 
   async runQuery(query: string): Promise<RunQueryResult | undefined> {
     this.abortController = new AbortController();
     let finalAnswer: string | undefined;
+
+    // bash `allow-session` grants are scoped to a single query: prune them at the
+    // start of each new query while leaving write/edit (file:write) grants intact.
+    for (const key of this.sessionApprovedTools) {
+      if (key.startsWith('bash:')) this.sessionApprovedTools.delete(key);
+    }
 
     const startTime = Date.now();
     const item: HistoryItem = {
@@ -110,6 +181,9 @@ export class AgentRunnerController {
     this.inMemoryChatHistory.saveUserQuery(query);
     this.errorValue = null;
     this.workingStateValue = { status: 'thinking' };
+    this.turnStartMsValue = startTime;
+    this.streamedCharsValue = 0;
+    this.streamModeValue = 'requesting';
     this.emitChange();
 
     try {
@@ -117,7 +191,9 @@ export class AgentRunnerController {
         ...this.agentConfig,
         signal: this.abortController.signal,
         requestToolApproval: this.requestToolApproval,
+        requestUserInput: this.requestUserInput,
         sessionApprovedTools: this.sessionApprovedTools,
+        messageQueue: defaultQueue,
       });
       const stream = agent.run(query, this.inMemoryChatHistory);
       for await (const event of stream) {
@@ -126,6 +202,14 @@ export class AgentRunnerController {
         }
         await this.handleEvent(event);
       }
+
+      // Post-run: if messages arrived after the agent's last drain, start a new turn
+      if (!defaultQueue.isEmpty()) {
+        const remaining = defaultQueue.dequeueAll();
+        const mergedText = remaining.map(m => m.text).join('\n\n');
+        return this.runQuery(mergedText);
+      }
+
       if (finalAnswer) {
         return { answer: finalAnswer };
       }
@@ -134,6 +218,7 @@ export class AgentRunnerController {
       if (error instanceof Error && error.name === 'AbortError') {
         this.markLastProcessing('interrupted');
         this.workingStateValue = { status: 'idle' };
+        this.resetTurnStats();
         this.emitChange();
         return undefined;
       }
@@ -141,6 +226,7 @@ export class AgentRunnerController {
       this.errorValue = message;
       this.markLastProcessing('error');
       this.workingStateValue = { status: 'idle' };
+      this.resetTurnStats();
       this.emitChange();
       return undefined;
     } finally {
@@ -148,11 +234,26 @@ export class AgentRunnerController {
     }
   }
 
-  private requestToolApproval = (request: { tool: string; args: Record<string, unknown> }) => {
+  private resetTurnStats() {
+    this.turnStartMsValue = null;
+    this.streamedCharsValue = 0;
+    this.streamModeValue = null;
+  }
+
+  private requestToolApproval = (request: PendingApproval) => {
     return new Promise<ApprovalDecision>((resolve) => {
       this.approvalResolve = resolve;
       this.pendingApprovalValue = request;
       this.workingStateValue = { status: 'approval', toolName: request.tool };
+      this.emitChange();
+    });
+  };
+
+  private requestUserInput = (request: { questions: Question[] }) => {
+    return new Promise<UserAnswers>((resolve) => {
+      this.questionResolve = resolve;
+      this.pendingQuestionValue = request;
+      this.workingStateValue = { status: 'question' };
       this.emitChange();
     });
   };
@@ -168,7 +269,7 @@ export class AgentRunnerController {
         });
         break;
       case 'tool_start': {
-        const toolId = `tool-${event.tool}-${Date.now()}`;
+        const toolId = event.toolCallId ?? `tool-${event.tool}-${Date.now()}`;
         this.workingStateValue = { status: 'tool', toolName: event.tool };
         this.updateLastItem((last) => ({
           ...last,
@@ -184,22 +285,38 @@ export class AgentRunnerController {
         }));
         break;
       }
-      case 'tool_progress':
+      case 'tool_progress': {
+        const progressToolId = event.toolCallId ?? this.getLastItem()?.activeToolId;
         this.updateLastItem((last) => ({
           ...last,
           events: last.events.map((entry) =>
-            entry.id === last.activeToolId ? { ...entry, progressMessage: event.message } : entry,
+            entry.id === progressToolId ? { ...entry, progressMessage: event.message } : entry,
           ),
         }));
         break;
-      case 'tool_end':
-        this.finishToolEvent(event);
+      }
+      case 'tool_end': {
+        const endToolId = event.toolCallId ?? this.getLastItem()?.activeToolId;
+        this.updateLastItem((last) => ({
+          ...last,
+          events: last.events.map((entry) =>
+            entry.id === endToolId ? { ...entry, completed: true, endEvent: event } : entry,
+          ),
+        }));
         this.workingStateValue = { status: 'thinking' };
         break;
-      case 'tool_error':
-        this.finishToolEvent(event);
+      }
+      case 'tool_error': {
+        const errToolId = event.toolCallId ?? this.getLastItem()?.activeToolId;
+        this.updateLastItem((last) => ({
+          ...last,
+          events: last.events.map((entry) =>
+            entry.id === errToolId ? { ...entry, completed: true, endEvent: event } : entry,
+          ),
+        }));
         this.workingStateValue = { status: 'thinking' };
         break;
+      }
       case 'tool_approval':
         this.pushEvent({
           id: `approval-${event.tool}-${Date.now()}`,
@@ -216,12 +333,22 @@ export class AgentRunnerController {
         break;
       case 'tool_limit':
       case 'context_cleared':
+      case 'compaction':
+      case 'microcompact':
+      case 'queue_drain':
         this.pushEvent({
           id: `${event.type}-${Date.now()}`,
           event,
           completed: true,
         });
         break;
+      case 'stream_progress':
+        // Update accumulators without firing onChange — the working indicator
+        // pulls turnStats on its own spinner tick. Avoids a per-chunk emitChange
+        // storm that stutters input.
+        this.streamedCharsValue += event.charDelta;
+        this.streamModeValue = event.mode;
+        return;
       case 'done': {
         const done = event as DoneEvent;
         if (done.answer) {
@@ -236,24 +363,19 @@ export class AgentRunnerController {
           tokensPerSecond: done.tokensPerSecond,
         }));
         this.workingStateValue = { status: 'idle' };
+        this.resetTurnStats();
         break;
       }
     }
     this.emitChange();
   }
 
-  private finishToolEvent(event: AgentEvent) {
-    this.updateLastItem((last) => ({
-      ...last,
-      activeToolId: undefined,
-      events: last.events.map((entry) =>
-        entry.id === last.activeToolId ? { ...entry, completed: true, endEvent: event } : entry,
-      ),
-    }));
-  }
-
   private pushEvent(displayEvent: DisplayEvent) {
     this.updateLastItem((last) => ({ ...last, events: [...last.events, displayEvent] }));
+  }
+
+  private getLastItem(): HistoryItem | undefined {
+    return this.historyValue[this.historyValue.length - 1];
   }
 
   private updateLastItem(updater: (item: HistoryItem) => HistoryItem) {

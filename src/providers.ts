@@ -14,6 +14,8 @@ export interface ProviderDef {
   apiKeyEnvVar?: string;
   /** Fast model variant for lightweight tasks like summarization. */
   fastModel?: string;
+  /** Default context window size in tokens. Used for model-aware compaction thresholds. */
+  contextWindow?: number;
 }
 
 export const PROVIDERS: ProviderDef[] = [
@@ -22,7 +24,8 @@ export const PROVIDERS: ProviderDef[] = [
     displayName: 'OpenAI',
     modelPrefix: '',
     apiKeyEnvVar: 'OPENAI_API_KEY',
-    fastModel: 'gpt-4.1',
+    fastModel: 'gpt-6-luna',
+    contextWindow: 1_047_576,
   },
   {
     id: 'anthropic',
@@ -30,34 +33,39 @@ export const PROVIDERS: ProviderDef[] = [
     modelPrefix: 'claude-',
     apiKeyEnvVar: 'ANTHROPIC_API_KEY',
     fastModel: 'claude-haiku-4-5',
+    contextWindow: 1_000_000,
   },
   {
     id: 'google',
     displayName: 'Google',
     modelPrefix: 'gemini-',
     apiKeyEnvVar: 'GOOGLE_API_KEY',
-    fastModel: 'gemini-3-flash-preview',
+    fastModel: 'gemini-3.8-flash',
+    contextWindow: 1_000_000,
   },
   {
     id: 'xai',
     displayName: 'xAI',
     modelPrefix: 'grok-',
     apiKeyEnvVar: 'XAI_API_KEY',
-    fastModel: 'grok-4-1-fast-reasoning',
+    fastModel: 'grok-4.7',
+    contextWindow: 500_000,
   },
   {
     id: 'moonshot',
     displayName: 'Moonshot',
     modelPrefix: 'kimi-',
     apiKeyEnvVar: 'MOONSHOT_API_KEY',
-    fastModel: 'kimi-k2-5',
+    fastModel: 'kimi-k3',
+    contextWindow: 1_000_000,
   },
   {
     id: 'deepseek',
     displayName: 'DeepSeek',
     modelPrefix: 'deepseek-',
     apiKeyEnvVar: 'DEEPSEEK_API_KEY',
-    fastModel: 'deepseek-chat',
+    fastModel: 'deepseek-flash',
+    contextWindow: 1_000_000,
   },
   {
     id: 'openrouter',
@@ -65,11 +73,20 @@ export const PROVIDERS: ProviderDef[] = [
     modelPrefix: 'openrouter:',
     apiKeyEnvVar: 'OPENROUTER_API_KEY',
     fastModel: 'openrouter:openai/gpt-4o-mini',
+    contextWindow: 128_000,
   },
   {
     id: 'ollama',
     displayName: 'Ollama',
     modelPrefix: 'ollama:',
+    contextWindow: 128_000,
+  },
+  {
+    id: 'ollama-cloud',
+    displayName: 'Ollama Cloud',
+    modelPrefix: 'ollama-cloud:',
+    apiKeyEnvVar: 'OLLAMA_CLOUD_API_KEY',
+    contextWindow: 128_000,
   },
 ];
 

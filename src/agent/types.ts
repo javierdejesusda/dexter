@@ -1,4 +1,7 @@
 import type { GroupContext } from './prompts.js';
+import type { MessageQueue } from '../utils/message-queue.js';
+import type { Question, UserAnswers } from '../tools/ask-user-question/types.js';
+import type { PermissionDecision } from '../permissions/types.js';
 
 // ============================================================================
 // Channel Profiles
@@ -28,8 +31,8 @@ export interface ChannelProfile {
 /**
  * User's response to a tool approval prompt.
  * - 'allow-once': approve this single invocation
- * - 'allow-session': approve all invocations of this tool for the rest of the session
- * - 'allow-always': approve and persist across sessions
+ * - 'allow-session': approve this command/tool for the rest of the session (bash: this query)
+ * - 'allow-always': approve AND persist (bash: a rule in .dexter/settings.json; edits: the approval in .dexter/permissions.json)
  * - 'deny': reject and immediately end the agent's turn
  */
 export type ApprovalDecision = 'allow-once' | 'allow-session' | 'allow-always' | 'deny';
@@ -38,7 +41,7 @@ export type ApprovalDecision = 'allow-once' | 'allow-session' | 'allow-always' |
  * Agent configuration
  */
 export interface AgentConfig {
-  /** Model to use for LLM calls (e.g., 'gpt-5.4', 'claude-sonnet-4-20250514') */
+  /** Model to use for LLM calls (e.g., 'gpt-5.6-sol', 'claude-sonnet-4-20250514') */
   model?: string;
   /** Model provider (e.g., 'openai', 'anthropic', 'google', 'ollama') */
   modelProvider?: string;
@@ -51,11 +54,35 @@ export interface AgentConfig {
   /** Group chat context — when set, adds group-specific instructions to system prompt */
   groupContext?: GroupContext;
   /** Called when a tool needs explicit user approval to proceed */
-  requestToolApproval?: (request: { tool: string; args: Record<string, unknown> }) => Promise<ApprovalDecision>;
+  requestToolApproval?: (request: {
+    tool: string;
+    args: Record<string, unknown>;
+    /** For bash: the command being approved (shown instead of a file path). */
+    command?: string;
+    /** The engine's full decision (reason, classification, etc.) for richer prompts. */
+    decision?: PermissionDecision;
+  }) => Promise<ApprovalDecision>;
+  /** CLI-only: called when the agent asks the user interactive questions mid-turn. */
+  requestUserInput?: (request: { questions: Question[] }) => Promise<UserAnswers>;
   /** Shared set of tool names that have been session-approved (persists across queries) */
   sessionApprovedTools?: Set<string>;
   /** Enable/disable persistent memory integration for this run */
   memoryEnabled?: boolean;
+  /** Message queue for mid-run injection of new user messages. */
+  messageQueue?: MessageQueue;
+  /**
+   * Restrict this agent to a subset of tools, by registry name. When set, only
+   * matching tools are bound. Used to give a delegated worker a focused toolset.
+   */
+  toolAllowlist?: string[];
+  /**
+   * Use this exact system prompt instead of building one. When set, the soul,
+   * rules, and memory context are skipped entirely. Used by delegated workers
+   * that run with a self-contained worker prompt.
+   */
+  systemPromptOverride?: string;
+  /** Optional short label (e.g. "research") used to prefix nested progress lines. */
+  agentLabel?: string;
 }
 
 /**
@@ -85,6 +112,8 @@ export interface ToolStartEvent {
   type: 'tool_start';
   tool: string;
   args: Record<string, unknown>;
+  /** Unique tool_call ID from the AIMessage (for concurrent execution ordering). */
+  toolCallId?: string;
 }
 
 /**
@@ -96,6 +125,8 @@ export interface ToolEndEvent {
   args: Record<string, unknown>;
   result: string;
   duration: number;
+  /** Unique tool_call ID from the AIMessage (for concurrent execution ordering). */
+  toolCallId?: string;
 }
 
 /**
@@ -105,6 +136,8 @@ export interface ToolErrorEvent {
   type: 'tool_error';
   tool: string;
   error: string;
+  /** Unique tool_call ID from the AIMessage (for concurrent execution ordering). */
+  toolCallId?: string;
 }
 
 /**
@@ -114,6 +147,8 @@ export interface ToolProgressEvent {
   type: 'tool_progress';
   tool: string;
   message: string;
+  /** Unique tool_call ID, so progress routes to the right row under concurrent execution. */
+  toolCallId?: string;
 }
 
 /**
@@ -145,6 +180,8 @@ export interface ToolDeniedEvent {
   type: 'tool_denied';
   tool: string;
   args: Record<string, unknown>;
+  /** Unique tool_call ID from the AIMessage (for concurrent execution ordering). */
+  toolCallId?: string;
 }
 
 /**
@@ -177,12 +214,67 @@ export interface MemoryFlushEvent {
 }
 
 /**
+ * The model's current activity within a streamed turn.
+ */
+export type StreamMode = 'requesting' | 'thinking' | 'responding' | 'tool-input' | 'tool-use';
+
+/**
+ * One streaming chunk's progress: how many characters arrived and which content type.
+ * The agent runner accumulates charDelta into a per-turn counter for the working indicator.
+ */
+export interface StreamProgressEvent {
+  type: 'stream_progress';
+  charDelta: number;
+  mode: StreamMode;
+}
+
+/**
  * Token usage statistics
  */
 export interface TokenUsage {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+}
+
+/**
+ * Queued messages were drained and injected into the conversation.
+ */
+export interface QueueDrainEvent {
+  type: 'queue_drain';
+  /** Number of messages drained from the queue. */
+  messageCount: number;
+  /** The merged text injected as a HumanMessage. */
+  mergedText: string;
+  /** Each drained message, in the order they were merged. */
+  texts: string[];
+}
+
+/**
+ * Microcompact: per-turn lightweight trimming of old ToolMessage content.
+ */
+export interface MicrocompactEvent {
+  type: 'microcompact';
+  /** Number of ToolMessages whose content was cleared. */
+  cleared: number;
+  /** Estimated tokens saved by clearing. */
+  tokensSaved: number;
+}
+
+/**
+ * Context compaction lifecycle event (LLM summarization).
+ */
+export interface CompactionEvent {
+  type: 'compaction';
+  phase: 'start' | 'end';
+  /** Whether compaction succeeded (only present on 'end' phase). */
+  success?: boolean;
+  /** Estimated tokens before compaction. */
+  preCompactTokens?: number;
+  /** Estimated tokens after compaction. */
+  postCompactTokens?: number;
+  /** Model used for the compaction call. */
+  compactionModel?: string;
 }
 
 /**
@@ -211,8 +303,12 @@ export type AgentEvent =
   | ToolDeniedEvent
   | ToolLimitEvent
   | ContextClearedEvent
+  | QueueDrainEvent
+  | MicrocompactEvent
+  | CompactionEvent
   | MemoryRecalledEvent
   | MemoryFlushEvent
+  | StreamProgressEvent
   | DoneEvent;
 
 /**

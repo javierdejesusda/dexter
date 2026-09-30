@@ -13,25 +13,24 @@ interface Provider {
 
 const PROVIDER_MODELS: Record<string, Model[]> = {
   openai: [
-    { id: 'gpt-5.4', displayName: 'GPT 5.4' },
-    { id: 'gpt-4.1', displayName: 'GPT 4.1' },
+    { id: 'gpt-6-astra', displayName: 'GPT 6 Astra' },
+    { id: 'gpt-6-sol', displayName: 'GPT 6 Sol' },
+    { id: 'gpt-6-luna', displayName: 'GPT 6 Luna' },
   ],
   anthropic: [
-    { id: 'claude-sonnet-4-6', displayName: 'Sonnet 4.6' },
-    { id: 'claude-opus-4-6', displayName: 'Opus 4.6' },
+    { id: 'claude-sonnet-5', displayName: 'Sonnet 5' },
+    { id: 'claude-opus-5-5', displayName: 'Opus 5.5' },
+    { id: 'claude-fable-5-1', displayName: 'Fable 5.1' },
   ],
   google: [
-    { id: 'gemini-3-flash-preview', displayName: 'Gemini 3 Flash' },
+    { id: 'gemini-3.8-flash', displayName: 'Gemini 3.8 Flash' },
     { id: 'gemini-3.1-pro-preview', displayName: 'Gemini 3.1 Pro' },
   ],
-  xai: [
-    { id: 'grok-4-0709', displayName: 'Grok 4' },
-    { id: 'grok-4-1-fast-reasoning', displayName: 'Grok 4.1 Fast Reasoning' },
-  ],
-  moonshot: [{ id: 'kimi-k2-5', displayName: 'Kimi K2.5' }],
+  xai: [{ id: 'grok-4.7', displayName: 'Grok 4.7' }],
+  moonshot: [{ id: 'kimi-k3', displayName: 'Kimi K3' }],
   deepseek: [
-    { id: 'deepseek-chat', displayName: 'DeepSeek V3' },
-    { id: 'deepseek-reasoner', displayName: 'DeepSeek R1' },
+    { id: 'deepseek-v4-pro', displayName: 'DeepSeek V4 Pro' },
+    { id: 'deepseek-flash', displayName: 'DeepSeek V4.1 Flash' },
   ],
 };
 
@@ -56,7 +55,7 @@ export function getDefaultModelForProvider(providerId: string): string | undefin
 }
 
 export function getModelDisplayName(modelId: string): string {
-  const normalizedId = modelId.replace(/^(ollama|openrouter):/, '');
+  const normalizedId = modelId.replace(/^(ollama|ollama-cloud|openrouter):/, '');
 
   for (const provider of PROVIDERS) {
     const model = provider.models.find((entry) => entry.id === normalizedId || entry.id === modelId);
